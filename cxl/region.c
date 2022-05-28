@@ -45,6 +45,9 @@ struct parsed_params {
 
 enum region_actions {
 	ACTION_CREATE,
+	ACTION_ENABLE,
+	ACTION_DISABLE,
+	ACTION_DESTROY,
 };
 
 static struct log_ctx rl;
@@ -78,7 +81,22 @@ static const struct option create_options[] = {
 	OPT_END(),
 };
 
+static const struct option enable_options[] = {
+	BASE_OPTIONS(),
+	OPT_END(),
+};
 
+static const struct option disable_options[] = {
+	BASE_OPTIONS(),
+	OPT_END(),
+};
+
+static const struct option destroy_options[] = {
+	BASE_OPTIONS(),
+	OPT_BOOLEAN('f', "force", &param.force,
+		    "destroy region even if currently active"),
+	OPT_END(),
+};
 
 static int parse_create_options(int argc, const char **argv,
 				struct parsed_params *p)
@@ -495,11 +513,90 @@ err_delete:
 	return rc;
 }
 
+static int destroy_region(struct cxl_region *region)
+{
+	const char *devname = cxl_region_get_devname(region);
+	unsigned int ways, i;
+	int rc;
+
+	/* First, unbind/disable the region if needed */
+	if (cxl_region_is_enabled(region)) {
+		if (param.force) {
+			rc = cxl_region_disable(region);
+			if (rc) {
+				log_err(&rl, "%s: error disabling region: %s\n",
+					devname, strerror(-rc));
+				return rc;
+			}
+		} else {
+			log_err(&rl, "%s active. Disable it or use --force\n",
+				devname);
+			return -EBUSY;
+		}
+	}
+
+	/* De-commit the region in preparation for removal */
+	rc = cxl_region_decommit(region);
+	if (rc) {
+		log_err(&rl, "%s: failed to decommit: %s\n", devname,
+			strerror(-rc));
+		return rc;
+	}
+
+	/* Reset all endpoint decoders and region targets */
+	ways = cxl_region_get_interleave_ways(region);
+	if (ways == 0 || ways == UINT_MAX) {
+		log_err(&rl, "%s: error getting interleave ways\n", devname);
+		return -ENXIO;
+	}
+
+	for (i = 0; i < ways; i++) {
+		struct cxl_decoder *ep_decoder;
+
+		ep_decoder = cxl_region_get_target_decoder(region, i);
+		if (!ep_decoder)
+			return -ENXIO;
+
+		rc = cxl_region_clear_target(region, i);
+		if (rc) {
+			log_err(&rl, "%s: clearing target%d failed: %s\n",
+				devname, i, strerror(abs(rc)));
+			return rc;
+		}
+
+		rc = cxl_decoder_set_dpa_size(ep_decoder, 0);
+		if (rc) {
+			log_err(&rl, "%s: set_dpa_size failed: %s\n",
+				cxl_decoder_get_devname(ep_decoder),
+				strerror(abs(rc)));
+			return rc;
+		}
+	}
+
+	/* Finally, delete the region */
+	return cxl_region_delete(region);
+}
+
+static int do_region_xable(struct cxl_region *region, enum region_actions action)
+{
+	switch (action) {
+	case ACTION_ENABLE:
+		return cxl_region_enable(region);
+	case ACTION_DISABLE:
+		return cxl_region_disable(region);
+	case ACTION_DESTROY:
+		return destroy_region(region);
+	default:
+		return -EINVAL;
+	}
+}
+
 static int region_action(int argc, const char **argv, struct cxl_ctx *ctx,
 			 enum region_actions action,
 			 const struct option *options, struct parsed_params *p,
 			 int *count, const char *u)
 {
+	struct cxl_bus *bus;
 	int rc = -ENXIO;
 
 	log_init(&rl, "cxl region", "CXL_REGION_LOG");
@@ -509,6 +606,45 @@ static int region_action(int argc, const char **argv, struct cxl_ctx *ctx,
 
 	if (action == ACTION_CREATE)
 		return create_region(ctx, count, p);
+
+	cxl_bus_foreach(ctx, bus) {
+		struct cxl_decoder *decoder;
+		struct cxl_port *port;
+
+		port = cxl_bus_get_port(bus);
+		if (!cxl_port_is_root(port))
+			continue;
+
+		cxl_decoder_foreach (port, decoder) {
+			struct cxl_region *region, *_r;
+
+			decoder = util_cxl_decoder_filter(decoder,
+							  param.root_decoder);
+			if (!decoder)
+				continue;
+			cxl_region_foreach_safe(decoder, region, _r)
+			{
+				int i, match = 0;
+
+				for (i = 0; i < p->num_targets; i++) {
+					if (util_cxl_region_filter(
+						    region, p->targets[i])) {
+						match = 1;
+						break;
+					}
+				}
+				if (!match)
+					continue;
+
+				rc = do_region_xable(region, action);
+				if (rc == 0)
+					*count += 1;
+				else
+					log_err(&rl, "%s: failed: %s\n",
+						cxl_region_get_devname(region),
+						strerror(-rc));
+			}
+		}
 	}
 
 	return rc;
@@ -523,5 +659,41 @@ int cmd_create_region(int argc, const char **argv, struct cxl_ctx *ctx)
 	rc = region_action(argc, argv, ctx, ACTION_CREATE, create_options, &p,
 			   &count, u);
 	log_info(&rl, "created %d region%s\n", count, count == 1 ? "" : "s");
+	return rc == 0 ? 0 : EXIT_FAILURE;
+}
+
+int cmd_enable_region(int argc, const char **argv, struct cxl_ctx *ctx)
+{
+	const char *u = "cxl enable-region <region0> ... [<options>]";
+	struct parsed_params p = { 0 };
+	int rc, count = 0;
+
+	rc = region_action(argc, argv, ctx, ACTION_ENABLE, enable_options, &p,
+			   &count, u);
+	log_info(&rl, "enabled %d region%s\n", count, count == 1 ? "" : "s");
+	return rc == 0 ? 0 : EXIT_FAILURE;
+}
+
+int cmd_disable_region(int argc, const char **argv, struct cxl_ctx *ctx)
+{
+	const char *u = "cxl disable-region <region0> ... [<options>]";
+	struct parsed_params p = { 0 };
+	int rc, count = 0;
+
+	rc = region_action(argc, argv, ctx, ACTION_DISABLE, disable_options, &p,
+			   &count, u);
+	log_info(&rl, "disabled %d region%s\n", count, count == 1 ? "" : "s");
+	return rc == 0 ? 0 : EXIT_FAILURE;
+}
+
+int cmd_destroy_region(int argc, const char **argv, struct cxl_ctx *ctx)
+{
+	const char *u = "cxl destroy-region <region0> ... [<options>]";
+	struct parsed_params p = { 0 };
+	int rc, count = 0;
+
+	rc = region_action(argc, argv, ctx, ACTION_DESTROY, destroy_options, &p,
+			   &count, u);
+	log_info(&rl, "destroyed %d region%s\n", count, count == 1 ? "" : "s");
 	return rc == 0 ? 0 : EXIT_FAILURE;
 }
